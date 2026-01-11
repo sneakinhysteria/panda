@@ -203,8 +203,11 @@ uint16_t rpm;
 uint16_t intermediary_rpm;
 uint8_t scaled_rpm;
 
+// Maxxecu RPM vars
+uint16_t maxxecu_rpm = 0;
+bool maxxecu_rpm_valid = false;
 
- // ECU/SAM CANBUS
+// ECU/SAM CANBUS
 void CAN1_RX0_IRQ_Handler(void) {
   while ((CAN1->RF0R & CAN_RF0R_FMP0) != 0) {
     CAN_FIFOMailBox_TypeDef to_send;
@@ -215,6 +218,9 @@ void CAN1_RX0_IRQ_Handler(void) {
     puth(address);
     puts("\n");
     #endif
+    for (int i=0; i<8; i++) {
+      dat[i] = GET_BYTE(&CAN1->sFIFOMailBox[0], i);
+    }
     switch (address) {
       case CAN_UPDATE:
         if (GET_BYTES_04(&CAN1->sFIFOMailBox[0]) == 0xdeadface) {
@@ -229,30 +235,19 @@ void CAN1_RX0_IRQ_Handler(void) {
           }
         }
         break;
-      case 0x300: ; //RPM SIGNAL
-
-         //Get can messages
-        for (int i=0; i<8; i++) {
-          dat[i] = GET_BYTE(&CAN1->sFIFOMailBox[0], i);
-        }
+      case 0x520: // Maxxecu Mini RPM message
+        // Extract RPM from bytes 0 (LSB), 1 (MSB)
+        maxxecu_rpm = dat[0] | ((uint16_t)dat[1] << 8);
+        maxxecu_rpm_valid = true;
+        break;
+      case 0x300: ; // Factory RPM SIGNAL (kept for fallback or legacy)
         rpm = dat[2] | (uint16_t)(dat[1] << 8); //Read RPM signal
         intermediary_rpm = ((rpm/364) * 255 ); //Scale RPM signal for our purposes 9000rpm - 6300
         //intermediary_rpm = ((rpm/403) * 255); //Scale RPM signal for our purposes 9950rpm - 6300
-
         scaled_rpm = intermediary_rpm/25  + 12; //Apply DBC scale factor for cluster
         if(rpm>9000)
           scaled_rpm = 255;
-        #ifdef DEBUG_CAN
-        puts("Decoded RPM: ");
-        puth(rpm);
-        puts("Mathed RPM: ");
-        puth(intermediary_rpm);
-        puts("Scaled RPM: ");
-        puth(scaled_rpm);
-        puts("\n");
-        #endif
-        //Forward message unmolested to cluster and abs
-        
+        // Forward message unmolested to cluster and abs
         to_send.RDLR = dat[0] | (dat[1] << 8) | (dat[2] << 16) | (dat[3] << 24);
         to_send.RDHR = dat[4] | (dat[5] << 8) | (dat[6] << 16) | (dat[7] << 24);
         to_send.RDTR = 8;
@@ -260,12 +255,13 @@ void CAN1_RX0_IRQ_Handler(void) {
         can_send(&to_send, 1, false);
         can_send(&to_send, 2, false);
         break;
-      
       case 0x190: ; //The message we manipulate 
-        //Get can messages
-        for (int i=0; i<8; i++) {
-          dat[i] = GET_BYTE(&CAN1->sFIFOMailBox[0], i);
-        }
+        // Use Maxxecu RPM if valid, otherwise fallback to factory ECU
+        uint16_t rpm_to_use = maxxecu_rpm_valid ? maxxecu_rpm : (dat[2] | ((uint16_t)dat[1] << 8));
+        intermediary_rpm = ((rpm_to_use/364) * 255 );
+        scaled_rpm = intermediary_rpm/25 + 12;
+        if(rpm_to_use > 9000)
+          scaled_rpm = 255;
         //original message with spoofed RPM
         to_send.RDLR = dat[0] | (dat[1] << 8) | (scaled_rpm << 16) | (dat[3] << 24);
         to_send.RDHR = dat[4] | (dat[5] << 8) | (dat[6] << 16) | (dat[7] << 24);
@@ -276,7 +272,6 @@ void CAN1_RX0_IRQ_Handler(void) {
         to_send.RDLR = dat[0] | (dat[1] << 8) | (dat[2] << 16) | (dat[3] << 24);
         can_send(&to_send, 2, false);
         break;
-
       default: ; //forward to cluster and esp unmolested
         to_send.RIR = CAN1->sFIFOMailBox[0].RIR | 1U;
         to_send.RDTR = CAN1->sFIFOMailBox[0].RDTR;
@@ -297,10 +292,9 @@ void CAN1_SCE_IRQ_Handler(void) {
   llcan_clear_send(CAN1);
 }
 
-
 //CLUSTER CAN
 void CAN2_RX0_IRQ_Handler(void) {
-  //All messages from cluster shoot through to both buses no fuckery
+  //All messages from cluster shoot through to both buses no manipulation
   while ((CAN2->RF0R & CAN_RF0R_FMP0) != 0) {
     #ifdef DEBUG_CAN
     puts("CAN2 RX: ");
@@ -325,7 +319,6 @@ void CAN2_SCE_IRQ_Handler(void) {
   can_sce(CAN2);
   llcan_clear_send(CAN2);
 }
-
 
 //ESP CANBUS
 void CAN3_RX0_IRQ_Handler(void) {
@@ -355,14 +348,11 @@ void CAN3_SCE_IRQ_Handler(void) {
   llcan_clear_send(CAN3);
 }
 
-
 // ***************************** main code *****************************
-
 
 void kombi(void) {
   // read/write
   watchdog_feed();
-
 }
 
 int main(void) {
@@ -397,15 +387,15 @@ int main(void) {
   #endif
 
   // init can
-  bool llcan_speed_set = llcan_set_speed(CAN1, 5000, false, false);
+  bool llcan_speed_set = llcan_set_speed(CAN1, 500000, false, false);
   if (!llcan_speed_set) {
     puts("Failed to set llcan1 speed");
   }
-  llcan_speed_set = llcan_set_speed(CAN2, 5000, false, false);
+  llcan_speed_set = llcan_set_speed(CAN2, 500000, false, false);
   if (!llcan_speed_set) {
     puts("Failed to set llcan2 speed");
   }
-  llcan_speed_set = llcan_set_speed(CAN3, 5000, false, false);
+  llcan_speed_set = llcan_set_speed(CAN3, 500000, false, false);
   if (!llcan_speed_set) {
     puts("Failed to set llcan3 speed");
   }
