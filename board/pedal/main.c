@@ -135,7 +135,30 @@ uint32_t current_index = 0;
 #define FAULT_STARTUP 4U
 #define FAULT_TIMEOUT 5U
 #define FAULT_INVALID 6U
+#define FAULT_PEDAL 7U
 uint8_t state = FAULT_STARTUP;
+
+// ***************************** pedal plausibility *****************************
+//
+// PLACEHOLDER VALUES - NOT CALIBRATED. Measure on the bench before use.
+//
+// To calibrate: read the CAN status frame (0x201, bytes 0-1 = track 0,
+// bytes 2-3 = track 1) with the pedal released and fully pressed.
+//
+//   PEDAL_RAW_MIN   below the released reading, above a shorted-to-ground reading
+//   PEDAL_RAW_MAX   above the pressed reading, below a shorted-to-rail reading
+//   PEDAL_MAX_DIFF  larger than the worst normal disagreement across full travel
+//
+// The Smart pedal's two tracks track each other closely: measured resistance
+// travel is 715 ohm on one and 710 ohm on the other, both rising with pedal
+// press. So the tracks are compared directly, with no ratio correction.
+#define PEDAL_RAW_MIN 400U
+#define PEDAL_RAW_MAX 3600U
+#define PEDAL_MAX_DIFF 200U
+
+#ifndef MIN
+  #define MIN(a, b) ((a) < (b) ? (a) : (b))
+#endif
 
 const uint8_t crc_poly = 0xD5;  // standard crc8
 
@@ -263,18 +286,48 @@ void TIM3_IRQ_Handler(void) {
 // ***************************** main code *****************************
 
 void pedal(void) {
-  // read/write
+  // read both tracks
   pdl0 = adc_get(ADCCHAN_ACCEL0);
   pdl1 = adc_get(ADCCHAN_ACCEL1);
 
-  // write the pedal to the DAC
-  if (state == NO_FAULT) {
-    dac_set(0, MAX(gas_set_0, pdl0));
-    dac_set(1, MAX(gas_set_1, pdl1));
+  // absolute range check on each track independently. Catches an open circuit,
+  // a short to ground and a short to the rail - none of which the cross-track
+  // comparison below can see, because those faults can move both tracks together.
+  bool range_ok = (pdl0 >= PEDAL_RAW_MIN) && (pdl0 <= PEDAL_RAW_MAX) &&
+                  (pdl1 >= PEDAL_RAW_MIN) && (pdl1 <= PEDAL_RAW_MAX);
+
+  // cross-track agreement
+  uint32_t diff = (pdl0 > pdl1) ? (pdl0 - pdl1) : (pdl1 - pdl0);
+  bool tracks_agree = diff <= PEDAL_MAX_DIFF;
+
+  if (!range_ok || !tracks_agree) {
+    state = FAULT_PEDAL;
+  } else if (state == FAULT_PEDAL) {
+    // sensor recovered - drop back to startup so the normal CAN handshake
+    // has to re-enable output rather than it resuming on its own
+    state = FAULT_STARTUP;
   } else {
-    dac_set(0, pdl0);
-    dac_set(1, pdl1);
+    // leave CAN fault states alone
   }
+
+  // one checked pedal value from the two tracks. Lower of the two, so a track
+  // reading high can never raise the output.
+  uint32_t pedal_checked = MIN(pdl0, pdl1);
+
+  uint32_t out;
+  if (state == FAULT_PEDAL) {
+    // pedal reading is untrusted - do not pass it through
+    out = 0;
+  } else if (state == NO_FAULT) {
+    out = MAX(MAX(gas_set_0, gas_set_1), pedal_checked);
+  } else {
+    // CAN fault, pedal still trusted - driver keeps control
+    out = pedal_checked;
+  }
+
+  // both outputs carry the same checked value
+  dac_set(0, out);
+  dac_set(1, out);
 
   watchdog_feed();
 }
