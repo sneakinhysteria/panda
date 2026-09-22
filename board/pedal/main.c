@@ -319,7 +319,10 @@ void pedal(void) {
     // pedal reading is untrusted - do not pass it through
     out = 0;
   } else if (state == NO_FAULT) {
-    out = MAX(MAX(gas_set_0, gas_set_1), pedal_checked);
+    // both casts matter: uint16_t promotes to int, and comparing that
+    // against the uint32_t pedal value is a signedness mismatch
+    uint32_t gas_requested = MAX((uint32_t)gas_set_0, (uint32_t)gas_set_1);
+    out = MAX(gas_requested, pedal_checked);
   } else {
     // CAN fault, pedal still trusted - driver keeps control
     out = pedal_checked;
